@@ -7,6 +7,8 @@ services:
       - "8000:8000"
     environment:
       COAL_DB_PATH: /data/coal.db
+      # 预检凭证有效期（秒）；到期后 activate-checked 返回 ticket_expired
+      COAL_TICKET_TTL_SECONDS: "900"
     volumes:
       - coal-data:/data
     restart: unless-stopped

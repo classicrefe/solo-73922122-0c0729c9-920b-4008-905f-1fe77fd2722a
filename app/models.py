@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 # 测值合法范围（万分比整数）
 MIN_VALUE = 0
@@ -147,6 +147,85 @@ class RuleOut(BaseModel):
     moisture_hi: int
     ash_lo: int
     ash_hi: int
+
+
+# --------------------------------------------------------------- 预检 / 受控启用
+class PreflightRequest(BaseModel):
+    """用一条**已成功入仓**的历史批次验证候选版。"""
+
+    batch_no: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        validation_alias=AliasChoices("batch_no", "baseline_batch_no"),
+        description="已成功批号；取其入仓时保存的原档区间、原等级与原规则重算候选版",
+    )
+
+    model_config = {
+        "populate_by_name": True,
+        "json_schema_extra": {
+            "examples": [{"batch_no": "BATCH-DEMO-001"}]
+        },
+    }
+
+
+class PreflightSample(RejudgedSample):
+    """预检中的一条样：与重判结果同构，便于直接比对见证值与候选等级。"""
+
+
+class PreflightFailure(BaseModel):
+    """预检未通过的一个样号。"""
+
+    sample_no: str
+    original_grade: Optional[str]
+    reason: str = Field(..., description="infeasible_original_grade 或 ambiguous_grade")
+    message: str
+    options: List[GradeOption] = Field(
+        default_factory=list,
+        description="候选版下的等级选项及每个等级的见证测值与可行对数；无解时为空",
+    )
+
+
+class PreflightResult(BaseModel):
+    """预检通过：全部样号在候选版下唯一，签发一次性启用凭证。"""
+
+    batch_no: str
+    original_version: str
+    candidate_version: str
+    current_version: str
+    sample_count: int
+    samples: List[PreflightSample]
+    ticket: str = Field(..., description="一次性启用凭证，仅本次响应返回明文")
+    expires_at: str = Field(..., description="凭证过期时间（UTC ISO8601）")
+    preflighted_at: str
+
+
+class ActivateCheckedRequest(BaseModel):
+    """凭预检签发的一次性凭证受控启用。"""
+
+    ticket: str = Field(
+        ...,
+        min_length=16,
+        max_length=256,
+        validation_alias=AliasChoices("ticket", "activation_token"),
+        description="预检通过后返回的一次性凭证",
+    )
+
+    model_config = {
+        "populate_by_name": True,
+        "json_schema_extra": {
+            "examples": [{"ticket": "填入 POST /api/versions/{code}/preflight 返回的 ticket"}]
+        },
+    }
+
+
+class ActivateCheckedResult(BaseModel):
+    code: str
+    active: bool
+    previous_version: str
+    batch_no: str
+    consumed_at: str
+    sample_count: int
 
 
 class ErrorResponse(BaseModel):

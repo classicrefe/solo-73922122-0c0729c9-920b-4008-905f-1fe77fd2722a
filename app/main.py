@@ -16,6 +16,10 @@ from pydantic import BaseModel
 
 from .db import Database, VersionConflict
 from .models import (
+    ActivateCheckedRequest,
+    ActivateCheckedResult,
+    PreflightRequest,
+    PreflightResult,
     RejudgeRequest,
     RejudgeResult,
     RuleOut,
@@ -23,10 +27,17 @@ from .models import (
     VersionOut,
 )
 from .service import (
+    ActivationRejected,
+    BaselineArchiveUnavailable,
+    BaselineBatchNotFound,
+    CandidateVersionNotFound,
     InfeasibleOriginalGrade,
     NoActiveVersion,
     OriginalVersionNotFound,
+    PreflightFailed,
     VersionDrift,
+    activate_checked,
+    preflight_version,
     rejudge_batch,
 )
 
@@ -115,6 +126,73 @@ def _orig_not_found_handler(_request: Request, exc: OriginalVersionNotFound):
     return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"detail": str(exc)})
 
 
+@app.exception_handler(CandidateVersionNotFound)
+def _candidate_not_found_handler(_request: Request, exc: CandidateVersionNotFound):
+    return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"detail": str(exc)})
+
+
+@app.exception_handler(BaselineBatchNotFound)
+def _baseline_not_found_handler(_request: Request, exc: BaselineBatchNotFound):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": {
+                "reason": "baseline_batch_not_found",
+                "message": str(exc),
+                "batch_no": exc.batch_no,
+            }
+        },
+    )
+
+
+@app.exception_handler(BaselineArchiveUnavailable)
+def _baseline_archive_handler(_request: Request, exc: BaselineArchiveUnavailable):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": {
+                "reason": "baseline_archive_unavailable",
+                "message": str(exc),
+                "batch_no": exc.batch_no,
+            }
+        },
+    )
+
+
+@app.exception_handler(PreflightFailed)
+def _preflight_failed_handler(_request: Request, exc: PreflightFailed):
+    """预检未通过：返回样号、候选等级选项与见证值，绝不签发凭证。"""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": {
+                "reason": "preflight_failed",
+                "message": "原档无解或候选等级不唯一，未生成启用凭证",
+                "samples": exc.samples,
+            }
+        },
+    )
+
+
+@app.exception_handler(ActivationRejected)
+def _activation_rejected_handler(_request: Request, exc: ActivationRejected):
+    status_code = (
+        status.HTTP_404_NOT_FOUND
+        if exc.status in {"ticket_not_found", "candidate_missing"}
+        else status.HTTP_409_CONFLICT
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "detail": {
+                "reason": exc.status,
+                "message": "受控启用被拒绝，原现行版保持不变",
+                "state": exc.detail,
+            }
+        },
+    )
+
+
 @app.exception_handler(NoActiveVersion)
 def _no_active_handler(_request: Request, exc: NoActiveVersion):
     return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
@@ -173,6 +251,30 @@ def activate_version(code: str):
     return ActivateResponse(code=code, active=True)
 
 
+@app.post("/api/versions/{code}/preflight", response_model=PreflightResult, tags=["rules"])
+def preflight(code: str, body: PreflightRequest):
+    """用一条**已成功入仓**的历史批次验证待启用版本；通过才签发一次性凭证。
+
+    * 基准数据取自该批入仓时保存的原档区间、原等级与**原规则**，按候选版重算；
+    * 任一原档无解或候选等级不唯一 => 422，返回样号、等级选项与见证值，不签发凭证；
+    * 全部唯一 => 返回各样的定级与 ``ticket``（仅此一次明文）。
+    """
+    return preflight_version(get_db(), body, code)
+
+
+@app.post(
+    "/api/versions/{code}/activate-checked",
+    response_model=ActivateCheckedResult,
+    tags=["rules"],
+)
+def activate_checked_version(code: str, body: ActivateCheckedRequest):
+    """凭预检凭证受控启用；基准批 / 原规则 / 预检时现行版任一变化都拒绝。
+
+    失败返回 409（凭证不存在为 404），**原现行版保持不变**；凭证一次性，成功后失效。
+    """
+    return activate_checked(get_db(), code, body.ticket)
+
+
 @app.get("/api/active", tags=["rules"])
 def get_active_version():
     active = get_db().get_active()
@@ -208,6 +310,28 @@ def query_batch(batch_no: str):
 def batch_rejections(batch_no: str):
     """查询该批号的退回记录（原等级无解 / 期间换版）。"""
     return get_db().list_rejections(batch_no)
+
+
+@app.get("/api/batches/{batch_no}/original-archive", tags=["preflight"])
+def batch_original_archive(batch_no: str):
+    """回取预检所用原档：入仓时保存的样号、原档区间、原等级与原规则快照。
+
+    旧库迁移前入仓的历史行 ``archive_available=false``：原规则已回填，但原档
+    区间当时未保存，需重新成功重判该批一次后才可预检。
+    """
+    view = get_db().get_batch_preflight_view(batch_no)
+    if view is None:
+        raise HTTPException(status_code=404, detail=f"批号无成功入仓结果: {batch_no}")
+    return {
+        "batch_no": view["batch_no"],
+        "original_version": view["original_code"],
+        "judged_version": view["judged_code"],
+        "record_count": view["record_count"],
+        "updated_at": view["updated_at"],
+        "archive_available": view["archive_available"],
+        "original_archive": view["original_archive"],
+        "original_rules": view["original_rules"],
+    }
 
 
 @app.get("/api/rejections", tags=["rejudge"])

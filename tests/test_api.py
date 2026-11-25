@@ -90,6 +90,14 @@ def test_rejudge_unique_multi_and_persistence(client):
     assert r.status_code == 200
     assert r.json()["judged_version"] == "v2"
 
+    # 回取预检所用原档
+    r = client.get("/api/batches/B-API-1/original-archive")
+    assert r.status_code == 200
+    archive = r.json()
+    assert archive["archive_available"] is True
+    assert archive["original_archive"]["records"][1]["moisture"] == {"lo": 900, "hi": 1150}
+    assert [x["grade"] for x in archive["original_rules"]][0] == "优质煤"
+
 
 def test_rejudge_infeasible_returns_422_and_no_result(client):
     payload = {
